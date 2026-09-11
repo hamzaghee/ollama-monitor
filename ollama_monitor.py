@@ -60,6 +60,89 @@ aux_state = {
     "selection_notice": None,  # set when the saved selection no longer fits the machine
 }
 
+# Set when the window is closed. Every worker loop watches it so they can unwind
+# normally: Python kills daemon threads at interpreter exit WITHOUT running their
+# finally blocks, which is how a sample file and a helper process got abandoned on
+# every close.
+shutdown = threading.Event()
+
+# Guards the handle on the running typeperf child, so shutdown can reach in and
+# stop it from whichever thread notices first.
+sampler_lock = threading.Lock()
+active_sampler = None
+
+# Sample files this process has created and not yet deleted. The per-sample finally
+# block normally clears each one, but it cannot run if a worker is still killed
+# abruptly, so the exit path deletes whatever is left here by name - it cannot rely
+# on the age-based sweep, which deliberately spares files this new.
+our_samples = set()
+
+GPU_SAMPLE_PREFIX = "gpu_sample_"
+STALE_SAMPLE_AGE_SECONDS = 300
+
+
+def terminate_active_sampler():
+    """
+    Stop the typeperf helper if one is mid-run.
+
+    It is a separate process, so closing our window does not end it. Left alone
+    with our end of its pipes gone it can block indefinitely rather than exiting
+    on its own - one was found still resident 21 hours after the app had closed.
+    """
+    with sampler_lock:
+        proc = active_sampler
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def final_cleanup():
+    """
+    Last pass on the way out: stop any surviving helper and delete the sample files
+    this run created, by name. Called after the workers have been given their chance
+    to unwind, so it normally finds nothing left to do.
+    """
+    terminate_active_sampler()
+    with sampler_lock:
+        leftovers = list(our_samples)
+        our_samples.clear()
+    for path in leftovers:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    purge_stale_gpu_samples()
+
+
+def purge_stale_gpu_samples():
+    """
+    Delete sample files stranded by earlier runs.
+
+    The routine cleanup is a finally block in sample_gpu_engine_counters; sweeping
+    here as well is what actually clears the backlog, since that block is exactly
+    what gets skipped when the app is killed mid-sample. Files younger than a few
+    minutes are left alone in case a second copy of the monitor is running.
+    """
+    temp_dir = tempfile.gettempdir()
+    cutoff = time.time() - STALE_SAMPLE_AGE_SECONDS
+    try:
+        names = os.listdir(temp_dir)
+    except OSError:
+        return
+
+    for name in names:
+        if not (name.startswith(GPU_SAMPLE_PREFIX) and name.endswith(".csv")):
+            continue
+        path = os.path.join(temp_dir, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass  # held by another instance, or already gone - either is fine
+
+
 # --- Regex patterns matching llama.cpp's slot timing log lines ---
 RE_NEW_PROMPT = re.compile(
     r"new prompt, n_ctx_slot = (?P<n_ctx>\d+), n_keep = \d+, task\.n_tokens = (?P<n_tokens>\d+)"
@@ -112,14 +195,18 @@ def snapshot_to_history(s, model_name):
 def tail_log(path):
     """Generator that yields new lines appended to `path`, like `tail -f`."""
     while not os.path.exists(path):
-        time.sleep(1)
+        if shutdown.wait(1):
+            return
 
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         f.seek(0, os.SEEK_END)  # start at end of file, only show new lines
-        while True:
+        while not shutdown.is_set():
             line = f.readline()
             if not line:
-                time.sleep(0.1)
+                # wait() rather than sleep() so a close is noticed immediately
+                # instead of after the full poll interval.
+                if shutdown.wait(0.1):
+                    return
                 continue
             yield line.rstrip("\n")
 
@@ -175,7 +262,7 @@ def parser_thread():
 
 def ollama_models_thread():
     """Poll Ollama's own /api/ps endpoint to see which model(s) are currently loaded and their VRAM footprint."""
-    while True:
+    while not shutdown.is_set():
         try:
             with urllib.request.urlopen(OLLAMA_API, timeout=3) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -193,7 +280,7 @@ def ollama_models_thread():
             with aux_lock:
                 aux_state["models"] = []
                 aux_state["models_error"] = str(e)
-        time.sleep(MODEL_POLL_SECONDS)
+        shutdown.wait(MODEL_POLL_SECONDS)
 
 
 # --- DXGI adapter enumeration -------------------------------------------------
@@ -399,22 +486,55 @@ def sample_gpu_engine_counters():
     can assume a narrow display width and insert line breaks mid-row, corrupting the CSV
     structure. Writing straight to a file avoids that entirely.
 
+    Its stdout is discarded rather than piped. We never read it - the results come
+    from the file - and an unread pipe is what let an orphaned typeperf wedge: once
+    this process is gone nobody drains the buffer, so the child blocks on a write
+    that will never complete instead of finishing its two samples and exiting.
+
     "Utilization Percentage" is a rate counter - it needs two samples to compute a
     percentage, so a single sample always comes back blank (a single space character,
     not zero). We request 2 samples one second apart and use the second, discarding
     the first.
     """
+    global active_sampler
+
     tmp_path = None
+    if shutdown.is_set():
+        return {}  # closing: do not start another helper we would have to chase
+
     try:
         # Build a path without creating the file first - if it already exists, typeperf
         # silently prompts "overwrite? Y/N" on stdin and hangs forever waiting for input
         # we never send, since nothing is connected to answer it.
-        tmp_path = os.path.join(tempfile.gettempdir(), f"gpu_sample_{uuid.uuid4().hex}.csv")
+        tmp_path = os.path.join(tempfile.gettempdir(),
+                                f"{GPU_SAMPLE_PREFIX}{uuid.uuid4().hex}.csv")
+
+        with sampler_lock:
+            our_samples.add(tmp_path)
 
         cmd = ["typeperf", r"\GPU Engine(*)\Utilization Percentage", "-sc", "2", "-f", "CSV", "-o", tmp_path]
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15, creationflags=0x08000000)
-        if out.returncode != 0:
-            raise RuntimeError(out.stderr.strip() or "typeperf failed")
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                text=True, creationflags=0x08000000)
+        with sampler_lock:
+            active_sampler = proc
+            # A close can land in the gap between the loop's shutdown check and the
+            # child being registered above - in which case terminate_active_sampler()
+            # looked while this slot was still empty and found nothing to kill. Re-read
+            # the flag here, inside the same lock, so the child cannot be missed.
+            if shutdown.is_set():
+                proc.kill()
+        try:
+            _, errors = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise RuntimeError("typeperf timed out")
+        finally:
+            with sampler_lock:
+                active_sampler = None
+
+        if proc.returncode != 0:
+            raise RuntimeError((errors or "").strip() or "typeperf failed")
 
         with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
@@ -440,11 +560,13 @@ def sample_gpu_engine_counters():
             per_luid_max[luid] = max(per_luid_max.get(luid, 0.0), pct)
         return per_luid_max
     finally:
-        if tmp_path and os.path.exists(tmp_path):
+        if tmp_path:
             try:
                 os.remove(tmp_path)
             except OSError:
-                pass
+                pass  # never created, or already gone
+            with sampler_lock:
+                our_samples.discard(tmp_path)
 
 
 def gpu_usage_thread():
@@ -466,7 +588,7 @@ def gpu_usage_thread():
         aux_state["selected_gpu_keys"] = load_config()
 
     adapters = []
-    while True:
+    while not shutdown.is_set():
         per_luid = None
         last_error = None
         for attempt in range(3):
@@ -480,7 +602,8 @@ def gpu_usage_thread():
                 last_error = None
             except Exception as e:
                 last_error = str(e)
-            time.sleep(0.3)
+            if shutdown.wait(0.3):
+                return
 
         fresh = enumerate_adapters()
         if fresh:
@@ -508,7 +631,7 @@ def gpu_usage_thread():
             # if the sample was empty and there was no error, just leave the previous
             # aux_state["gpu_usage"] value in place (transient glitch, not worth flagging)
 
-        time.sleep(GPU_POLL_SECONDS)
+        shutdown.wait(GPU_POLL_SECONDS)
 
 
 def fmt(val, suffix="", digits=1):
@@ -669,6 +792,10 @@ class MonitorGUI:
         # Recalculate wrap widths whenever the window itself is resized, so long text
         # (the model name, long metric lines) wraps instead of getting clipped, and the
         # left panel actually shrinks instead of refusing to go below its natural size.
+        # Closing the window has to stand the workers down explicitly - see _on_close.
+        self._after_id = None
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
         root.bind("<Configure>", self._on_root_configure)
         root.update_idletasks()
         self._apply_responsive_layout(root.winfo_width())
@@ -695,6 +822,25 @@ class MonitorGUI:
 
     def _toggle_topmost(self):
         self.root.attributes("-topmost", self.topmost_var.get())
+
+    def _on_close(self):
+        """
+        Stand the background work down before tearing the window down.
+
+        Without this the interpreter exits the moment the window goes, killing the
+        worker threads where they stand - so the typeperf child is orphaned and its
+        temp file is never deleted. Signalling first gives both a chance to end
+        cleanly; main() then waits briefly for the threads to finish unwinding.
+        """
+        shutdown.set()
+        if self._after_id is not None:
+            try:
+                self.root.after_cancel(self._after_id)
+            except tk.TclError:
+                pass  # already fired or the widget is gone; nothing to cancel
+            self._after_id = None
+        terminate_active_sampler()
+        self.root.destroy()
 
     def _on_root_configure(self, event):
         if event.widget is self.root:
@@ -920,17 +1066,34 @@ class MonitorGUI:
                     ctx_str,
                 ))
 
-        self.root.after(200, self.refresh)
+        self._after_id = self.root.after(200, self.refresh)
 
 
 def main():
-    threading.Thread(target=parser_thread, daemon=True).start()
-    threading.Thread(target=ollama_models_thread, daemon=True).start()
-    threading.Thread(target=gpu_usage_thread, daemon=True).start()
+    purge_stale_gpu_samples()  # clear anything a previous run left behind
+
+    # Still daemons, so a wedged worker can never stop the app exiting - but they
+    # are joined below so that in the normal case they unwind properly first.
+    workers = [
+        threading.Thread(target=parser_thread, daemon=True),
+        threading.Thread(target=ollama_models_thread, daemon=True),
+        threading.Thread(target=gpu_usage_thread, daemon=True),
+    ]
+    for worker in workers:
+        worker.start()
 
     root = tk.Tk()
     app = MonitorGUI(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        shutdown.set()
+        terminate_active_sampler()
+        for worker in workers:
+            # Long enough for a killed sampler to unwind its own finally block;
+            # final_cleanup() covers whatever misses that window.
+            worker.join(timeout=3)
+        final_cleanup()
 
 
 if __name__ == "__main__":
