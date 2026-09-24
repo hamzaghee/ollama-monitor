@@ -1,0 +1,1 @@
+Lightweight app that monitors the performance of local LLMs loaded using Ollama. It works well enough in it's current state, but might require some config to match your specific setup. I've built a newer version of this app called Zoomies, which has a lot more configurability and supports llama.cpp models.
